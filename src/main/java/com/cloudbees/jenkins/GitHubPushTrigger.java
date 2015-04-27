@@ -3,18 +3,31 @@ package com.cloudbees.jenkins;
 import hudson.Extension;
 import hudson.Util;
 import hudson.console.AnnotatedLargeText;
+import hudson.model.AbstractProject;
 import hudson.model.Action;
 import hudson.model.Hudson;
 import hudson.model.Hudson.MasterComputer;
 import hudson.model.Item;
-import hudson.model.AbstractProject;
 import hudson.model.Project;
 import hudson.triggers.Trigger;
 import hudson.triggers.TriggerDescriptor;
 import hudson.util.FormValidation;
 import hudson.util.SequentialExecutionQueue;
 import hudson.util.StreamTaskListener;
+import jenkins.model.Jenkins;
+import net.sf.json.JSONObject;
+import org.apache.commons.codec.binary.Base64;
+import org.apache.commons.jelly.XMLOutput;
+import org.jenkinsci.main.modules.instance_identity.InstanceIdentity;
+import org.kohsuke.github.GHEvent;
+import org.kohsuke.github.GHException;
+import org.kohsuke.github.GHHook;
+import org.kohsuke.github.GHRepository;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerRequest;
 
+import javax.inject.Inject;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintStream;
@@ -28,33 +41,34 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-
-import jenkins.model.Jenkins;
-import net.sf.json.JSONObject;
-
-import org.apache.commons.codec.binary.Base64;
-import org.apache.commons.jelly.XMLOutput;
-import org.jenkinsci.main.modules.instance_identity.InstanceIdentity;
-import org.kohsuke.github.GHException;
-import org.kohsuke.github.GHRepository;
-import org.kohsuke.stapler.DataBoundConstructor;
-import org.kohsuke.stapler.QueryParameter;
-import org.kohsuke.stapler.StaplerRequest;
-
-import javax.inject.Inject;
 
 /**
  * Triggers a build when we receive a GitHub post-commit webhook.
  *
  * @author Kohsuke Kawaguchi
  */
-public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements GitHubTrigger {
+public class GitHubPushTrigger extends Trigger<AbstractProject<?, ?>> implements GitHubTrigger {
+
+    private boolean overrideEventTypes;
+    private EnumSet<GHEvent> eventTypes;
+
     @DataBoundConstructor
-    public GitHubPushTrigger() {
+    public GitHubPushTrigger(boolean overrideEventTypes, EnumSet<GHEvent> eventTypes) {
+        this.overrideEventTypes = overrideEventTypes;
+        this.eventTypes = eventTypes;
+    }
+
+    public boolean isOverrideEventTypes() {
+        return overrideEventTypes;
+    }
+
+    public EnumSet<GHEvent> getEventTypes() {
+        return eventTypes;
     }
 
     /**
@@ -68,8 +82,17 @@ public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements 
     /**
      * Called when a POST is made.
      */
-    public void onPost(String triggeredByUser) {
-        final String pushBy = triggeredByUser;
+    @Deprecated
+    public void onPost(String triggerByUser) {
+        onPost("", triggerByUser);
+    }
+
+    /**
+     * Called when a POST is made.
+     */
+    public void onPost(String eventType, String triggeredByUser) {
+        final String event = eventType;
+        final String author = triggeredByUser;
         getDescriptor().queue.execute(new Runnable() {
             private boolean runPolling() {
                 try {
@@ -78,45 +101,45 @@ public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements 
                     try {
                         PrintStream logger = listener.getLogger();
                         long start = System.currentTimeMillis();
-                        logger.println("Started on "+ DateFormat.getDateTimeInstance().format(new Date()));
+                        logger.println("Started on " + DateFormat.getDateTimeInstance().format(new Date()));
                         boolean result = job.poll(listener).hasChanges();
-                        logger.println("Done. Took "+ Util.getTimeSpanString(System.currentTimeMillis()-start));
-                        if(result)
+                        logger.println("Done. Took " + Util.getTimeSpanString(System.currentTimeMillis() - start));
+                        if (result)
                             logger.println("Changes found");
                         else
                             logger.println("No changes");
                         return result;
                     } catch (Error e) {
                         e.printStackTrace(listener.error("Failed to record SCM polling"));
-                        LOGGER.log(Level.SEVERE,"Failed to record SCM polling",e);
+                        LOGGER.log(Level.SEVERE, "Failed to record SCM polling", e);
                         throw e;
                     } catch (RuntimeException e) {
                         e.printStackTrace(listener.error("Failed to record SCM polling"));
-                        LOGGER.log(Level.SEVERE,"Failed to record SCM polling",e);
+                        LOGGER.log(Level.SEVERE, "Failed to record SCM polling", e);
                         throw e;
                     } finally {
                         listener.close();
                     }
                 } catch (IOException e) {
-                    LOGGER.log(Level.SEVERE,"Failed to record SCM polling",e);
+                    LOGGER.log(Level.SEVERE, "Failed to record SCM polling", e);
                 }
                 return false;
             }
 
             public void run() {
                 if (runPolling()) {
-                    String name = " #"+job.getNextBuildNumber();
-                    GitHubPushCause cause;
+                    String name = " #" + job.getNextBuildNumber();
+                    GitHubCause cause;
                     try {
-                        cause = new GitHubPushCause(getLogFile(), pushBy);
+                        cause = new GitHubCause(getLogFile(), event, author);
                     } catch (IOException e) {
-                        LOGGER.log(Level.WARNING, "Failed to parse the polling log",e);
-                        cause = new GitHubPushCause(pushBy);
+                        LOGGER.log(Level.WARNING, "Failed to parse the polling log", e);
+                        cause = new GitHubCause(event, author);
                     }
                     if (job.scheduleBuild(cause)) {
-                        LOGGER.info("SCM changes detected in "+ job.getName()+". Triggering "+name);
+                        LOGGER.info("SCM changes detected in " + job.getName() + ". Triggering " + name);
                     } else {
-                        LOGGER.info("SCM changes detected in "+ job.getName()+". Job is already in the queue");
+                        LOGGER.info("SCM changes detected in " + job.getName() + ". Job is already in the queue");
                     }
                 }
             }
@@ -127,19 +150,18 @@ public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements 
      * Returns the file that records the last/current polling activity.
      */
     public File getLogFile() {
-        return new File(job.getRootDir(),"github-polling.log");
+        return new File(job.getRootDir(), "github-polling.log");
     }
 
     /**
-     * @deprecated
-     *      Use {@link GitHubRepositoryNameContributor#parseAssociatedNames(AbstractProject)}
+     * @deprecated Use {@link GitHubRepositoryNameContributor#parseAssociatedNames(AbstractProject)}
      */
     public Set<GitHubRepositoryName> getGitHubRepositories() {
         return Collections.emptySet();
     }
 
     @Override
-    public void start(AbstractProject<?,?> project, boolean newInstance) {
+    public void start(AbstractProject<?, ?> project, boolean newInstance) {
         super.start(project, newInstance);
         if (newInstance && getDescriptor().isManageHook()) {
             registerHooks();
@@ -149,6 +171,7 @@ public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements 
     /**
      * Tries to register hook for current associated job.
      * Useful for using from groovy scripts.
+     *
      * @since 1.11.2
      */
     public void registerHooks() {
@@ -162,11 +185,11 @@ public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements 
                 for (GitHubRepositoryName name : names) {
                     for (GHRepository repo : name.resolve()) {
                         try {
-                            if(createJenkinsHook(repo, getDescriptor().getHookUrl())) {
+                            if (createJenkinsHook(repo, getDescriptor().getHookUrl())) {
                                 break;
                             }
                         } catch (Throwable e) {
-                            LOGGER.log(Level.WARNING, "Failed to add GitHub webhook for "+name, e);
+                            LOGGER.log(Level.WARNING, "Failed to add GitHub webhook for " + name, e);
                         }
                     }
                 }
@@ -174,9 +197,37 @@ public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements 
         });
     }
 
+    private void updateWebHook(GHRepository repo, URL url) {
+        try {
+            String urlExternalForm = url.toExternalForm();
+            GHHook hook = null;
+            for (GHHook h : repo.getHooks()) {
+                if (h.getName().equals("web") && h.getConfig().get("url").equals(urlExternalForm)) {
+                    hook = h;
+                }
+            }
+            if (hook == null) {
+                LOGGER.log(Level.INFO, "Creating WebHook");
+                repo.createWebHook(new URL(url.toExternalForm()), getHookEvents());
+            } else if (!hook.getEvents().equals(getHookEvents())) {
+                LOGGER.log(Level.INFO, "Updating WebHook");
+                hook.delete();
+                repo.createWebHook(new URL(url.toExternalForm()), getHookEvents());
+            } else {
+                LOGGER.log(Level.INFO, "WebHook unchanged");
+            }
+        } catch (IOException e) {
+            throw new GHException("Failed to update post-commit hooks", e);
+        }
+    }
+
     private boolean createJenkinsHook(GHRepository repo, URL url) {
         try {
-            repo.createHook("jenkins", Collections.singletonMap("jenkins_hook_url", url.toExternalForm()), null, true);
+            if (overrideEventTypes || getDescriptor().isUseEventTypes()) {
+                updateWebHook(repo, url);
+            } else {
+                repo.createHook("jenkins", Collections.singletonMap("jenkins_hook_url", url.toExternalForm()), null, true);
+            }
             return true;
         } catch (IOException e) {
             throw new GHException("Failed to update jenkins hooks", e);
@@ -200,14 +251,22 @@ public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements 
 
     @Override
     public DescriptorImpl getDescriptor() {
-        return (DescriptorImpl)super.getDescriptor();
+        return (DescriptorImpl) super.getDescriptor();
+    }
+
+    private EnumSet<GHEvent> getHookEvents() {
+        if (overrideEventTypes) {
+            return eventTypes;
+        }
+
+        return getDescriptor().getEventTypes();
     }
 
     /**
      * Action object for {@link Project}. Used to display the polling log.
      */
     public final class GitHubWebHookPollingAction implements Action {
-        public AbstractProject<?,?> getOwner() {
+        public AbstractProject<?, ?> getOwner() {
             return job;
         }
 
@@ -229,10 +288,11 @@ public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements 
 
         /**
          * Writes the annotated log to the given output.
+         *
          * @since 1.350
          */
         public void writeLogTo(XMLOutput out) throws IOException {
-            new AnnotatedLargeText<GitHubWebHookPollingAction>(getLogFile(), Charset.defaultCharset(),true,this).writeHtmlTo(0,out.asWriter());
+            new AnnotatedLargeText<GitHubWebHookPollingAction>(getLogFile(), Charset.defaultCharset(), true, this).writeHtmlTo(0, out.asWriter());
         }
     }
 
@@ -244,6 +304,8 @@ public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements 
         private boolean manageHook;
         private String hookUrl;
         private volatile List<Credential> credentials = new ArrayList<Credential>();
+        private boolean useEventTypes;
+        private List<GHEvent> eventTypes = new ArrayList<GHEvent>();
 
         @Inject
         private transient InstanceIdentity identity;
@@ -278,15 +340,30 @@ public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements 
          * Returns the URL that GitHub should post.
          */
         public URL getHookUrl() throws MalformedURLException {
-            return hookUrl!=null ? new URL(hookUrl) : new URL(Hudson.getInstance().getRootUrl()+GitHubWebHook.get().getUrlName()+'/');
+            return hookUrl != null ? new URL(hookUrl) : new URL(Hudson.getInstance().getRootUrl() + GitHubWebHook.get().getUrlName() + '/');
         }
 
         public boolean hasOverrideURL() {
-            return hookUrl!=null;
+            return hookUrl != null;
         }
 
         public List<Credential> getCredentials() {
             return credentials;
+        }
+
+        public boolean isUseEventTypes() {
+            return useEventTypes;
+        }
+
+        public void setUseEventTypes(boolean v) {
+            useEventTypes = v;
+            save();
+        }
+
+        public EnumSet<GHEvent> getEventTypes() {
+            EnumSet<GHEvent> enumSet = EnumSet.noneOf(GHEvent.class);
+            enumSet.addAll(eventTypes);
+            return enumSet;
         }
 
         @Override
@@ -298,7 +375,15 @@ public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements 
             } else {
                 hookUrl = null;
             }
-            credentials = req.bindJSONToList(Credential.class,hookMode.get("credentials"));
+            credentials = req.bindJSONToList(Credential.class, hookMode.get("credentials"));
+            useEventTypes = hookMode.optBoolean("useEventTypes");
+            JSONObject eventTypes = (JSONObject) hookMode.get("eventTypes");
+            this.eventTypes.clear();
+            for (Object key : eventTypes.keySet()) {
+                if ("true".equals(eventTypes.getString((String) key))) {
+                    this.eventTypes.add(GHEvent.valueOf((String) key));
+                }
+            }
             save();
             return true;
         }
@@ -309,11 +394,11 @@ public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements 
                 con.setRequestMethod("POST");
                 con.setRequestProperty(GitHubWebHook.URL_VALIDATION_HEADER, "true");
                 con.connect();
-                if (con.getResponseCode()!=200) {
-                    return FormValidation.error("Got "+con.getResponseCode()+" from "+value);
+                if (con.getResponseCode() != 200) {
+                    return FormValidation.error("Got " + con.getResponseCode() + " from " + value);
                 }
                 String v = con.getHeaderField(GitHubWebHook.X_INSTANCE_IDENTITY);
-                if (v==null) {
+                if (v == null) {
                     // people might be running clever apps that's not Jenkins, and that's OK
                     return FormValidation.warning("It doesn't look like " + value + " is talking to any Jenkins. Are you running your own app?");
                 }
@@ -321,12 +406,12 @@ public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements 
                 String expected = new String(Base64.encodeBase64(key.getEncoded()));
                 if (!expected.equals(v)) {
                     // if it responds but with a different ID, that's more likely wrong than correct
-                    return FormValidation.error(value+" is connecting to different Jenkins instances");
+                    return FormValidation.error(value + " is connecting to different Jenkins instances");
                 }
 
                 return FormValidation.ok();
             } catch (IOException e) {
-                return FormValidation.error(e,"Failed to test a connection to "+value);
+                return FormValidation.error(e, "Failed to test a connection to " + value);
             }
 
         }
@@ -337,13 +422,13 @@ public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements 
             }
 
             int triggered = 0;
-            for (AbstractProject<?,?> job : getJenkinsInstance().getAllItems(AbstractProject.class)) {
+            for (AbstractProject<?, ?> job : getJenkinsInstance().getAllItems(AbstractProject.class)) {
                 if (!job.isBuildable()) {
                     continue;
                 }
 
                 GitHubPushTrigger trigger = job.getTrigger(GitHubPushTrigger.class);
-                if (trigger!=null) {
+                if (trigger != null) {
                     LOGGER.log(Level.FINE, "Calling registerHooks() for {0}", job.getFullName());
                     trigger.registerHooks();
                     triggered++;
@@ -370,11 +455,10 @@ public class GitHubPushTrigger extends Trigger<AbstractProject<?,?>> implements 
             return ALLOW_HOOKURL_OVERRIDE;
         }
     }
-
     /**
      * Set to false to prevent the user from overriding the hook URL.
      */
-    public static boolean ALLOW_HOOKURL_OVERRIDE = !Boolean.getBoolean(GitHubPushTrigger.class.getName()+".disableOverride");
+    public static boolean ALLOW_HOOKURL_OVERRIDE = !Boolean.getBoolean(GitHubPushTrigger.class.getName() + ".disableOverride");
 
     private static final Logger LOGGER = Logger.getLogger(GitHubPushTrigger.class.getName());
 }
